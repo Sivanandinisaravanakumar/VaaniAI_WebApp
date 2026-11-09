@@ -1,0 +1,33 @@
+VAANIAI PROFESSIONAL WEB APP - QUICK START (WINDOWS)
+===================================================
+
+1. Extract this folder to a simple path, for example:
+   C:\Users\YOUR_USER\Downloads\VaaniAI_WebApp
+
+2. Double-click setup_windows.bat.
+   This creates the Python environment and installs backend + frontend packages.
+
+3. Open this file:
+   backend\.env
+
+4. Add your real API keys:
+   GNANI_API_KEY=your_real_gnani_key
+   GEMINI_API_KEY=your_real_gemini_key
+
+   Do not send your keys to anyone. Do not put them in the frontend folder.
+
+5. Double-click run_windows.bat.
+   Keep both command windows open.
+
+6. Open this in Chrome or Edge:
+   http://localhost:5173
+
+Backend API docs:
+   http://127.0.0.1:8000/docs
+
+IMPORTANT:
+- Keep your old Streamlit project as a backup. This is a separate React + FastAPI project.
+- This is a local MVP. Do not expose it publicly until authentication, per-user access,
+  HTTPS, rate limiting, backups and production privacy controls are added.
+- Gnani/Gemini quotas and account credits still apply. Fallback mode does not create
+  unlimited AI usage.
