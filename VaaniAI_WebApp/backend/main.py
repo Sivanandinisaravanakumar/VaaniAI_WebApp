@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -67,6 +67,26 @@ GEMINI_FALLBACK_MODELS = [
 MAX_AUDIO_SECONDS = int(os.getenv("MAX_AUDIO_SECONDS", "120"))
 CHUNK_SECONDS = int(os.getenv("GNANI_CHUNK_SECONDS", "28"))
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", str(ROOT_DIR / "vaaniai.db")))
+
+# Supabase configuration. The publishable key is used only to validate user
+# access tokens through Supabase Auth. The secret key stays on this backend
+# and is used for server-side database REST requests only.
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_PUBLISHABLE_KEY = os.getenv(
+    "SUPABASE_PUBLISHABLE_KEY", os.getenv("SUPABASE_ANON_KEY", "")
+).strip()
+SUPABASE_SECRET_KEY = os.getenv(
+    "SUPABASE_SECRET_KEY", os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+).strip()
+REQUIRE_AUTH = os.getenv("REQUIRE_AUTH", "false").strip().lower() in {"1", "true", "yes", "on"}
+USE_SUPABASE_DB = bool(SUPABASE_URL and SUPABASE_SECRET_KEY)
+
+if REQUIRE_AUTH and not (SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY and SUPABASE_SECRET_KEY):
+    raise RuntimeError(
+        "REQUIRE_AUTH is enabled, but Supabase URL, publishable key, and secret key are not configured."
+    )
+if REQUIRE_AUTH and not USE_SUPABASE_DB:
+    raise RuntimeError("Public authenticated deployment requires Supabase database storage.")
 
 FRONTEND_ORIGINS = os.getenv(
     "FRONTEND_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
@@ -127,7 +147,96 @@ def init_db() -> None:
         conn.commit()
 
 
-init_db()
+if not USE_SUPABASE_DB:
+    init_db()
+
+
+def supabase_admin_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
+        raise RuntimeError("Supabase database is not configured on the backend.")
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    if SUPABASE_SECRET_KEY.startswith("sb_secret_"):
+        # New Supabase secret keys are API keys, not JWTs: send in apikey only.
+        headers["apikey"] = SUPABASE_SECRET_KEY
+    else:
+        # Legacy service_role keys are JWTs: pair with the project's public key.
+        headers["apikey"] = SUPABASE_PUBLISHABLE_KEY
+        headers["Authorization"] = f"Bearer {SUPABASE_SECRET_KEY}"
+    if extra:
+        headers.update(extra)
+    return headers
+
+
+def supabase_rest(method: str, table: str, *, params: Optional[Dict[str, str]] = None,
+                  payload: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """Call Supabase PostgREST using a backend-only secret key.
+
+    The secret key is intentionally sent in the `apikey` header only. It must
+    never be placed in frontend code or VITE_* environment variables.
+    """
+    headers = supabase_admin_headers({"Prefer": "return=representation"})
+    try:
+        response = requests.request(
+            method,
+            f"{SUPABASE_URL}/rest/v1/{table}",
+            headers=headers,
+            params=params,
+            json=payload,
+            timeout=(5, 20),
+        )
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=503, detail="Supabase database is temporarily unavailable.") from exc
+    if not response.ok:
+        detail = "Supabase database request failed. Check the table schema and backend secret configuration."
+        try:
+            err = response.json()
+            if isinstance(err, dict) and err.get("message"):
+                detail = str(err["message"])[:300]
+        except ValueError:
+            pass
+        raise HTTPException(status_code=503, detail=detail)
+    if not response.content:
+        return []
+    try:
+        result = response.json()
+    except ValueError:
+        return []
+    return result if isinstance(result, list) else []
+
+
+def get_current_user(authorization: Optional[str] = Header(default=None)) -> Dict[str, str]:
+    """Validate a Supabase access token. Local development may run without auth."""
+    if not REQUIRE_AUTH:
+        return {"id": "local-development-user"}
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Please sign in to use VaaniAI.")
+    token = authorization.split(" ", 1)[1].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Your login session is invalid. Please sign in again.")
+    try:
+        response = requests.get(
+            f"{SUPABASE_URL}/auth/v1/user",
+            headers={
+                "apikey": SUPABASE_PUBLISHABLE_KEY,
+                "Authorization": f"Bearer {token}",
+            },
+            timeout=(5, 12),
+        )
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=503, detail="Authentication service is temporarily unavailable.") from exc
+    if response.status_code != 200:
+        raise HTTPException(status_code=401, detail="Your login session has expired. Please sign in again.")
+    try:
+        user = response.json()
+        user_id = str(user.get("id", ""))
+    except ValueError:
+        user_id = ""
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Could not verify your account. Please sign in again.")
+    return {"id": user_id}
 
 
 # -----------------------------------------------------------------------------
@@ -637,12 +746,27 @@ def audio_payload(audio: Tuple[bytes, str, str]) -> Dict[str, str]:
 # -----------------------------------------------------------------------------
 
 
-def get_interview(interview_id: str) -> Dict[str, Any]:
+def get_interview(interview_id: str, owner_id: str) -> Dict[str, Any]:
+    if USE_SUPABASE_DB:
+        rows = supabase_rest(
+            "GET", "interviews",
+            params={"select": "*", "id": f"eq.{interview_id}", "owner_id": f"eq.{owner_id}", "limit": "1"},
+        )
+        if not rows:
+            raise HTTPException(status_code=404, detail="Interview session not found.")
+        data = dict(rows[0])
+        data["history"] = data.get("history") or []
+        data["memory"] = data.get("memory") or []
+        data["pending_attempts"] = data.get("pending_attempts") or []
+        data["report"] = data.get("report")
+        return data
+
     with db_connect() as conn:
         row = conn.execute("SELECT * FROM interviews WHERE id = ?", (interview_id,)).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Interview session not found.")
     data = dict(row)
+    data["owner_id"] = owner_id
     for column, key in (
         ("history_json", "history"),
         ("memory_json", "memory"),
@@ -654,7 +778,68 @@ def get_interview(interview_id: str) -> Dict[str, Any]:
     return data
 
 
+def insert_interview(data: Dict[str, Any], owner_id: str) -> None:
+    if USE_SUPABASE_DB:
+        payload = {
+            "id": data["id"],
+            "owner_id": owner_id,
+            "candidate_name": data["candidate_name"],
+            "target_role": data["target_role"],
+            "interview_type": data["interview_type"],
+            "total_questions": data["total_questions"],
+            "question_number": data["question_number"],
+            "current_question": data["current_question"],
+            "history": data["history"],
+            "memory": data["memory"],
+            "pending_attempts": data["pending_attempts"],
+            "completed": data["completed"],
+            "report": data["report"],
+            "started_at": data["started_at"],
+            "completed_at": data["completed_at"],
+        }
+        rows = supabase_rest("POST", "interviews", payload=payload)
+        if not rows:
+            raise HTTPException(status_code=503, detail="Could not save the interview to Supabase.")
+        return
+
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO interviews (
+                id, candidate_name, target_role, interview_type, total_questions,
+                question_number, current_question, history_json, memory_json,
+                pending_attempts_json, completed, report_json, started_at, completed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, NULL)
+            """,
+            (
+                data["id"], data["candidate_name"], data["target_role"],
+                data["interview_type"], data["total_questions"], 1, data["current_question"],
+                "[]", "[]", "[]", data["started_at"],
+            ),
+        )
+        conn.commit()
+
+
 def save_interview(data: Dict[str, Any]) -> None:
+    if USE_SUPABASE_DB:
+        rows = supabase_rest(
+            "PATCH", "interviews",
+            params={"id": f"eq.{data['id']}", "owner_id": f"eq.{data['owner_id']}"},
+            payload={
+                "question_number": data["question_number"],
+                "current_question": data["current_question"],
+                "history": data["history"],
+                "memory": data["memory"],
+                "pending_attempts": data["pending_attempts"],
+                "completed": bool(data["completed"]),
+                "report": data.get("report"),
+                "completed_at": data.get("completed_at"),
+            },
+        )
+        if not rows:
+            raise HTTPException(status_code=404, detail="Interview session not found for this account.")
+        return
+
     with db_connect() as conn:
         conn.execute(
             """
@@ -714,11 +899,13 @@ def health() -> Dict[str, Any]:
         "gemini_configured": bool(GEMINI_API_KEY),
         "tts_configured": bool(GNANI_API_KEY),
         "primary_gemini_model": GEMINI_MODEL,
+        "auth_required": REQUIRE_AUTH,
+        "database_mode": "supabase" if USE_SUPABASE_DB else "local-sqlite",
     }
 
 
 @app.post("/api/interviews/start")
-def start_interview(payload: StartInterviewRequest) -> Dict[str, Any]:
+def start_interview(payload: StartInterviewRequest, user: Dict[str, str] = Depends(get_current_user)) -> Dict[str, Any]:
     name = payload.candidate_name.strip()
     if not name:
         raise HTTPException(status_code=422, detail="Please enter your name.")
@@ -744,6 +931,7 @@ def start_interview(payload: StartInterviewRequest) -> Dict[str, Any]:
     now = utc_now()
     record = {
         "id": interview_id,
+        "owner_id": user["id"],
         "candidate_name": name,
         "target_role": payload.target_role.strip() or "Graduate role",
         "interview_type": payload.interview_type,
@@ -758,22 +946,7 @@ def start_interview(payload: StartInterviewRequest) -> Dict[str, Any]:
         "started_at": now,
         "completed_at": None,
     }
-    with db_connect() as conn:
-        conn.execute(
-            """
-            INSERT INTO interviews (
-                id, candidate_name, target_role, interview_type, total_questions,
-                question_number, current_question, history_json, memory_json,
-                pending_attempts_json, completed, report_json, started_at, completed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, NULL)
-            """,
-            (
-                interview_id, record["candidate_name"], record["target_role"],
-                record["interview_type"], record["total_questions"], 1, question,
-                "[]", "[]", "[]", now,
-            ),
-        )
-        conn.commit()
+    insert_interview(record, user["id"])
     return {
         "interview_id": interview_id,
         "candidate_name": name,
@@ -796,8 +969,9 @@ async def transcribe_answer(
     interview_id: str,
     audio_file: UploadFile = File(...),
     candidate_name: str = Form(default="Candidate"),
+    user: Dict[str, str] = Depends(get_current_user),
 ) -> Dict[str, Any]:
-    get_interview(interview_id)
+    get_interview(interview_id, user["id"])
     if not audio_file.filename or not audio_file.filename.lower().endswith(".wav"):
         raise HTTPException(status_code=415, detail="Please record an answer and send it as WAV audio.")
     audio_bytes = await audio_file.read()
@@ -815,8 +989,8 @@ async def transcribe_answer(
 
 
 @app.post("/api/interviews/{interview_id}/answer")
-def submit_answer(interview_id: str, payload: SubmitAnswerRequest) -> Dict[str, Any]:
-    data = get_interview(interview_id)
+def submit_answer(interview_id: str, payload: SubmitAnswerRequest, user: Dict[str, str] = Depends(get_current_user)) -> Dict[str, Any]:
+    data = get_interview(interview_id, user["id"])
     if data["completed"]:
         raise HTTPException(status_code=409, detail="This interview has already been completed.")
     if payload.question_number != data["question_number"]:
@@ -855,8 +1029,8 @@ def submit_answer(interview_id: str, payload: SubmitAnswerRequest) -> Dict[str, 
 
 
 @app.post("/api/interviews/{interview_id}/select-attempt")
-def select_attempt(interview_id: str, payload: SelectAttemptRequest) -> Dict[str, Any]:
-    data = get_interview(interview_id)
+def select_attempt(interview_id: str, payload: SelectAttemptRequest, user: Dict[str, str] = Depends(get_current_user)) -> Dict[str, Any]:
+    data = get_interview(interview_id, user["id"])
     attempts = data["pending_attempts"]
     selected = next((item for item in attempts if item["attempt_number"] == payload.attempt_number), None)
     if not selected:
@@ -932,8 +1106,34 @@ def select_attempt(interview_id: str, payload: SelectAttemptRequest) -> Dict[str
 
 
 @app.get("/api/history")
-def list_history(limit: int = 30) -> Dict[str, Any]:
+def list_history(limit: int = 30, user: Dict[str, str] = Depends(get_current_user)) -> Dict[str, Any]:
     limit = max(1, min(100, limit))
+    if USE_SUPABASE_DB:
+        rows = supabase_rest(
+            "GET", "interviews",
+            params={
+                "select": "id,candidate_name,target_role,interview_type,total_questions,started_at,completed_at,report,completed",
+                "owner_id": f"eq.{user['id']}",
+                "order": "started_at.desc",
+                "limit": str(limit),
+            },
+        )
+        items = []
+        for row in rows:
+            report = row.get("report")
+            items.append({
+                "id": row["id"],
+                "candidate_name": row["candidate_name"],
+                "target_role": row["target_role"],
+                "interview_type": row["interview_type"],
+                "total_questions": row["total_questions"],
+                "started_at": row["started_at"],
+                "completed_at": row.get("completed_at"),
+                "completed": bool(row["completed"]),
+                "overall_score": report.get("overall_score") if isinstance(report, dict) else None,
+            })
+        return {"items": items}
+
     with db_connect() as conn:
         rows = conn.execute(
             "SELECT id, candidate_name, target_role, interview_type, total_questions, started_at, completed_at, report_json, completed FROM interviews ORDER BY started_at DESC LIMIT ?",
@@ -943,22 +1143,18 @@ def list_history(limit: int = 30) -> Dict[str, Any]:
     for row in rows:
         report = json.loads(row["report_json"]) if row["report_json"] else None
         items.append({
-            "id": row["id"],
-            "candidate_name": row["candidate_name"],
-            "target_role": row["target_role"],
-            "interview_type": row["interview_type"],
-            "total_questions": row["total_questions"],
-            "started_at": row["started_at"],
-            "completed_at": row["completed_at"],
-            "completed": bool(row["completed"]),
+            "id": row["id"], "candidate_name": row["candidate_name"],
+            "target_role": row["target_role"], "interview_type": row["interview_type"],
+            "total_questions": row["total_questions"], "started_at": row["started_at"],
+            "completed_at": row["completed_at"], "completed": bool(row["completed"]),
             "overall_score": report.get("overall_score") if report else None,
         })
     return {"items": items}
 
 
 @app.get("/api/history/{interview_id}")
-def history_detail(interview_id: str) -> Dict[str, Any]:
-    data = get_interview(interview_id)
+def history_detail(interview_id: str, user: Dict[str, str] = Depends(get_current_user)) -> Dict[str, Any]:
+    data = get_interview(interview_id, user["id"])
     return {
         "id": data["id"],
         "candidate_name": data["candidate_name"],
@@ -982,4 +1178,5 @@ def public_config() -> Dict[str, Any]:
         "max_audio_seconds": MAX_AUDIO_SECONDS,
         "question_types": list(QUESTION_BANK.keys()),
         "question_counts": [3, 5, 7],
+        "auth_required": REQUIRE_AUTH,
     }

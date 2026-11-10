@@ -21,3 +21,9 @@ frontend/.env.local
 .idea/
 .DS_Store
 Thumbs.db
+# Additional local environment variants
+backend/.env.*
+frontend/.env
+frontend/.env.*
+!frontend/.env.example
+!backend/.env.example

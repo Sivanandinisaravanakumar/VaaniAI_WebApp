@@ -7,6 +7,7 @@ import {
   MicOff, Pause, Play, Plus, RefreshCw, ShieldCheck, Sparkles, Target,
   TrendingUp, Volume2, WandSparkles, X, Zap,
 } from 'lucide-react';
+import { supabase } from './supabase.js';
 import {
   audioDataUrl, getHealth, getHistory, getHistoryDetail, getPublicConfig,
   selectAttempt, startInterview, submitAnswer, transcribeAnswer,
@@ -188,7 +189,7 @@ function ScoreRing({ score }) {
   </div>;
 }
 
-function App() {
+function VaaniAIApp({ user, onSignOut }) {
   const [page, setPage] = useState('overview');
   const [health, setHealth] = useState(null);
   const [history, setHistory] = useState([]);
@@ -198,7 +199,7 @@ function App() {
   const [error, setError] = useState('');
   const [mobileNav, setMobileNav] = useState(false);
 
-  const [candidateName, setCandidateName] = useState('');
+  const [candidateName, setCandidateName] = useState(user?.user_metadata?.full_name || '');
   const [targetRole, setTargetRole] = useState('AI Engineer');
   const [interviewType, setInterviewType] = useState('Full Placement Interview');
   const [totalQuestions, setTotalQuestions] = useState(5);
@@ -615,7 +616,7 @@ function App() {
     {renderSidebar()}
     {mobileNav && <button className="mobile-scrim" onClick={() => setMobileNav(false)} aria-label="Close navigation"/>}
     <main className="main-area">
-      <header className="topbar"><div className="topbar-left"><button className="icon-btn mobile-menu" onClick={() => setMobileNav(true)} aria-label="Open navigation"><Menu size={20}/></button><div className="breadcrumb">Workspace <ChevronRight size={13}/> <strong>{page === 'overview' ? 'Overview' : page === 'setup' ? 'New interview' : page === 'interview' ? 'Interview room' : page === 'report' ? 'Performance report' : 'Interview history'}</strong></div></div><div className="topbar-right"><div className={`backend-status ${health?.status === 'ok' ? 'online' : 'offline'}`}><span/>{health?.status === 'ok' ? 'Backend connected' : 'Backend offline'}</div><div className="topbar-avatar">{candidateName ? candidateName.slice(0, 1).toUpperCase() : 'S'}</div></div></header>
+      <header className="topbar"><div className="topbar-left"><button className="icon-btn mobile-menu" onClick={() => setMobileNav(true)} aria-label="Open navigation"><Menu size={20}/></button><div className="breadcrumb">Workspace <ChevronRight size={13}/> <strong>{page === 'overview' ? 'Overview' : page === 'setup' ? 'New interview' : page === 'interview' ? 'Interview room' : page === 'report' ? 'Performance report' : 'Interview history'}</strong></div></div><div className="topbar-right"><div className={`backend-status ${health?.status === 'ok' ? 'online' : 'offline'}`}><span/>{health?.status === 'ok' ? 'Backend connected' : 'Backend offline'}</div><div className="topbar-user-email">{user?.email || 'Local demo'}</div>{user?.email && <button className="signout-btn" onClick={onSignOut} title="Sign out"><LockKeyhole size={14}/> Sign out</button>}<div className="topbar-avatar">{candidateName ? candidateName.slice(0, 1).toUpperCase() : (user?.email?.slice(0, 1).toUpperCase() || 'S')}</div></div></header>
       <div className="page-content">
         {error && <div className="global-alert error-alert"><span>{error}</span><button onClick={() => setError('')}><X size={16}/></button></div>}
         {notice && !error && <div className="global-alert info-alert"><span>{notice}</span><button onClick={() => setNotice('')}><X size={16}/></button></div>}
@@ -630,4 +631,99 @@ function App() {
   </div>;
 }
 
-export default App;
+function AuthScreen() {
+  const [mode, setMode] = useState('signin');
+  const [fullName, setFullName] = useState('');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState('');
+  const [error, setError] = useState('');
+
+  const submit = async (event) => {
+    event.preventDefault();
+    setBusy(true);
+    setError('');
+    setMessage('');
+    try {
+      if (mode === 'signup') {
+        const { data, error: signUpError } = await supabase.auth.signUp({
+          email: email.trim(),
+          password,
+          options: { data: { full_name: fullName.trim() } },
+        });
+        if (signUpError) throw signUpError;
+        if (data.session) {
+          setMessage('Account created. Opening your VaaniAI workspace…');
+        } else {
+          setMessage('Account created. Please check your email to confirm your account, then sign in.');
+          setMode('signin');
+        }
+      } else {
+        const { error: signInError } = await supabase.auth.signInWithPassword({
+          email: email.trim(),
+          password,
+        });
+        if (signInError) throw signInError;
+      }
+    } catch (authError) {
+      setError(authError.message || 'Authentication failed. Please try again.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return <div className="auth-page">
+    <div className="auth-glow auth-glow-one"/><div className="auth-glow auth-glow-two"/>
+    <div className="auth-shell">
+      <div className="auth-brand"><div className="auth-brand-mark"><AudioLines size={26}/></div><div><strong>vaani<span>ai</span></strong><small>PERSONAL INTERVIEW COACH</small></div></div>
+      <div className="auth-card">
+        <div className="auth-kicker">YOUR PLACEMENT JOURNEY STARTS HERE</div>
+        <h1>{mode === 'signin' ? 'Welcome back.' : 'Create your account.'}</h1>
+        <p className="auth-subtitle">Practise English interviews, get thoughtful feedback, and grow with every attempt.</p>
+        <form onSubmit={submit} className="auth-form">
+          {mode === 'signup' && <label className="auth-field"><span>Full name</span><input required maxLength={80} value={fullName} onChange={(event) => setFullName(event.target.value)} placeholder="Your name" autoComplete="name"/></label>}
+          <label className="auth-field"><span>Email address</span><input required type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@example.com" autoComplete="email"/></label>
+          <label className="auth-field"><span>Password</span><input required type="password" minLength={6} value={password} onChange={(event) => setPassword(event.target.value)} placeholder="At least 6 characters" autoComplete={mode === 'signin' ? 'current-password' : 'new-password'}/></label>
+          {error && <div className="auth-message auth-error">{error}</div>}
+          {message && <div className="auth-message auth-success">{message}</div>}
+          <button className="auth-submit" type="submit" disabled={busy}>{busy ? <LoaderCircle className="spin" size={18}/> : <ShieldCheck size={18}/>} {mode === 'signin' ? 'Sign in to VaaniAI' : 'Create account'}</button>
+        </form>
+        <div className="auth-switch">{mode === 'signin' ? "Don't have an account?" : 'Already have an account?'} <button onClick={() => { setMode(mode === 'signin' ? 'signup' : 'signin'); setError(''); setMessage(''); }}>{mode === 'signin' ? 'Create one' : 'Sign in'}</button></div>
+      </div>
+      <div className="auth-footnote"><LockKeyhole size={13}/> Your interview history is private to your account.</div>
+    </div>
+  </div>;
+}
+
+export default function App() {
+  const [session, setSession] = useState(null);
+  const [checkingSession, setCheckingSession] = useState(Boolean(supabase));
+
+  useEffect(() => {
+    if (!supabase) return undefined;
+    let alive = true;
+    supabase.auth.getSession().then(({ data }) => {
+      if (alive) {
+        setSession(data.session || null);
+        setCheckingSession(false);
+      }
+    }).catch(() => {
+      if (alive) setCheckingSession(false);
+    });
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      setSession(nextSession || null);
+      setCheckingSession(false);
+    });
+    return () => {
+      alive = false;
+      listener.subscription.unsubscribe();
+    };
+  }, []);
+
+  // Without frontend Supabase settings the app remains usable for local-only development.
+  if (!supabase) return <VaaniAIApp user={null} onSignOut={() => {}}/>;
+  if (checkingSession) return <div className="auth-loading"><LoaderCircle className="spin" size={22}/> Checking your secure session…</div>;
+  if (!session) return <AuthScreen/>;
+  return <VaaniAIApp key={session.user.id} user={session.user} onSignOut={() => supabase.auth.signOut()}/>;
+}
